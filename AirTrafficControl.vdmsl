@@ -1,0 +1,261 @@
+module AirTrafficControl
+exports all
+definitions
+
+------------------------------------------------------------------
+-- TYPES
+------------------------------------------------------------------
+
+types
+
+AircraftID = token;
+RunwayID   = token;
+FlightNumber = token;
+
+AircraftStatus =
+    <AIRBORNE> | <LANDED> | <WAITING> | <APPROACHING> | <EMERGENCY>;
+
+RunwayStatus =
+    <FREE> | <OCCUPIED> | <MAINTENANCE>;
+
+WeatherStatus =
+    <CLEAR> | <CLOUDY> | <RAIN> | <STORM> | <FOG>;
+
+Aircraft ::
+    id: AircraftID
+    flight: FlightNumber
+    fuel: nat
+    status: AircraftStatus
+    altitude: nat
+    priority: nat
+;
+
+Runway ::
+    id: RunwayID
+    status: RunwayStatus
+    occupiedBy: [AircraftID]
+;
+
+------------------------------------------------------------------
+-- STATE
+------------------------------------------------------------------
+
+state ATC of
+
+aircrafts : map AircraftID to Aircraft;
+runways   : map RunwayID to Runway;
+weather   : WeatherStatus;
+queue     : seq of AircraftID;
+emergencyQueue : seq of AircraftID
+
+inv mk_ATC(a, r, w, q, e) ==
+    -- unique flight numbers
+    (forall id1, id2 in set dom a &
+        id1 <> id2 => a(id1).flight <> a(id2).flight)
+
+    -- runway consistency
+    and (forall rid in set dom r &
+        (r(rid).status = <FREE> or
+         r(rid).status = <OCCUPIED> or
+         r(rid).status = <MAINTENANCE>))
+
+    -- emergency priority always highest in queue
+    and (forall x in seq emergencyQueue &
+        aircrafts(x).status = <EMERGENCY>)
+
+end
+
+init s ==
+(
+    s.aircrafts := {|->};
+    s.runways := {|->};
+    s.weather := <CLEAR>;
+    s.queue := [];
+    s.emergencyQueue := []
+);
+
+------------------------------------------------------------------
+-- FUNCTIONS (Decision Logic Layer)
+------------------------------------------------------------------
+
+functions
+
+IsEmergency: Aircraft -> bool
+IsEmergency(a) == a.status = <EMERGENCY>;
+
+LowFuel: Aircraft -> bool
+LowFuel(a) == a.fuel < 25;
+
+ComputePriority: Aircraft -> nat
+ComputePriority(a) ==
+    if a.status = <EMERGENCY> then 100
+    elseif a.fuel < 10 then 90
+    elseif a.fuel < 25 then 70
+    elseif a.status = <APPROACHING> then 50
+    else a.priority;
+
+FindFreeRunway: map RunwayID to Runway -> [RunwayID]
+FindFreeRunway(rs) ==
+    let free = {r | r in set dom rs & rs(r).status = <FREE>} in
+        if free = {} then nil else hd set free;
+
+IsSafeWeather: WeatherStatus -> bool
+IsSafeWeather(w) == w <> <STORM>;
+
+------------------------------------------------------------------
+-- OPERATIONS (Core ATC Logic)
+------------------------------------------------------------------
+
+operations
+
+------------------------------------------------------------------
+-- Add Aircraft
+------------------------------------------------------------------
+
+AddAircraft: Aircraft ==> ()
+AddAircraft(a) ==
+(
+    aircrafts := aircrafts munion {a.id |-> a};
+
+    if a.status = <EMERGENCY> then
+        emergencyQueue := emergencyQueue ^ [a.id]
+    else
+        queue := queue ^ [a.id]
+)
+pre a.id not in set dom aircrafts
+post aircrafts(a.id) = a;
+
+------------------------------------------------------------------
+-- Add Runway
+------------------------------------------------------------------
+
+AddRunway: Runway ==> ()
+AddRunway(r) ==
+(
+    runways := runways munion {r.id |-> r}
+)
+pre r.id not in set dom runways
+post runways(r.id) = r;
+
+------------------------------------------------------------------
+-- Request Landing (Real ATC Logic)
+------------------------------------------------------------------
+
+RequestLanding: AircraftID ==> ()
+RequestLanding(id) ==
+(
+    let ac = aircrafts(id) in
+
+    if weather = <STORM> then
+        skip
+    else
+        let r == FindFreeRunway(runways) in
+
+        if r <> nil then
+        (
+            runways(r).status := <OCCUPIED>;
+            runways(r).occupiedBy := id;
+
+            aircrafts(id).status := <LANDED>;
+            aircrafts(id).altitude := 0;
+
+            queue := [x | x in seq queue & x <> id];
+            emergencyQueue := [x | x in seq emergencyQueue & x <> id]
+        )
+        else
+        (
+            aircrafts(id).status := <APPROACHING>;
+            queue := queue ^ [id]
+        )
+)
+pre id in set dom aircrafts
+post true;
+
+------------------------------------------------------------------
+-- Request Takeoff
+------------------------------------------------------------------
+
+RequestTakeoff: AircraftID ==> ()
+RequestTakeoff(id) ==
+(
+    if IsSafeWeather(weather) then
+    (
+        aircrafts(id).status := <AIRBORNE>;
+        aircrafts(id).altitude := 30000
+    )
+)
+pre id in set dom aircrafts
+post true;
+
+------------------------------------------------------------------
+-- Emergency Declaration (Critical System Feature)
+------------------------------------------------------------------
+
+DeclareEmergency: AircraftID ==> ()
+DeclareEmergency(id) ==
+(
+    aircrafts(id).status := <EMERGENCY>;
+    aircrafts(id).priority := 100;
+
+    emergencyQueue := [id] ^ [x | x in seq emergencyQueue & x <> id];
+    queue := [x | x in seq queue & x <> id]
+)
+pre id in set dom aircrafts
+post aircrafts(id).status = <EMERGENCY>;
+
+------------------------------------------------------------------
+-- Weather Update (System Risk Layer)
+------------------------------------------------------------------
+
+UpdateWeather: WeatherStatus ==> ()
+UpdateWeather(w) ==
+(
+    weather := w
+)
+post weather = w;
+
+------------------------------------------------------------------
+-- Release Runway (Post-Landing Ops)
+------------------------------------------------------------------
+
+ReleaseRunway: RunwayID ==> ()
+ReleaseRunway(id) ==
+(
+    runways(id).status := <FREE>;
+    runways(id).occupiedBy := nil
+)
+pre id in set dom runways
+post runways(id).status = <FREE>;
+
+------------------------------------------------------------------
+-- Cancel Flight (Operational Removal)
+------------------------------------------------------------------
+
+CancelFlight: AircraftID ==> ()
+CancelFlight(id) ==
+(
+    aircrafts := {id} <-: aircrafts;
+
+    queue := [x | x in seq queue & x <> id];
+    emergencyQueue := [x | x in seq emergencyQueue & x <> id]
+)
+pre id in set dom aircrafts
+post id not in set dom aircrafts;
+
+------------------------------------------------------------------
+-- Next Aircraft Decision Engine (ATC Brain)
+------------------------------------------------------------------
+
+GetNextAircraft: () ==> [AircraftID]
+GetNextAircraft() ==
+(
+    if emergencyQueue <> [] then
+        hd emergencyQueue
+    elseif queue <> [] then
+        hd queue
+    else
+        nil
+)
+post true;
+
+end AirTrafficControl
